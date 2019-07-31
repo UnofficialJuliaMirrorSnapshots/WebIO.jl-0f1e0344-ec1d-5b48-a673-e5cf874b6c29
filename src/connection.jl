@@ -5,7 +5,19 @@ export AbstractConnection
 abstract type AbstractConnection end
 
 """
-    ConnectionPool(outbox::Channel, connections::Set{AbstractConnection}=Set())
+The number of connections that we allow to be in a "pending" state (_i.e._ that
+haven't been moved from a `ConnectionPool`'s `new_connections` set to its
+`connections` set).
+"""
+const PENDING_CONNECTION_LIMIT = 32
+
+"""
+The maximum number of messages to allow into the outbox.
+"""
+const DEFAULT_OUTBOX_LIMIT = 32
+
+"""
+    ConnectionPool([outbox[, connections]])
 
 Manages the distribution of messages from the `outbox` channel to a set of
 connections. The ConnectionPool asynchronously takes messages from its outbox
@@ -16,23 +28,45 @@ struct ConnectionPool
     outbox::Channel
     connections::Set{AbstractConnection}
     new_connections::Channel{AbstractConnection}
-
-    function ConnectionPool(outbox::Channel, connections=Set{AbstractConnection}())
-        new_connections = Channel{AbstractConnection}(32)
-        pool = new(outbox, connections, new_connections)
-        @async process_messages(pool)
-        pool
-    end
 end
 
-addconnection!(pool::ConnectionPool, c::AbstractConnection) = put!(pool.new_connections, c)
-Sockets.send(pool::ConnectionPool, msg) = put!(pool.outbox, msg)
+function ConnectionPool(
+        outbox::Channel = Channel{Any}(DEFAULT_OUTBOX_LIMIT),
+        connections=Set{AbstractConnection}(),
+)
+    pool = ConnectionPool(
+        outbox,
+        connections,
+        Channel{AbstractConnection}(PENDING_CONNECTION_LIMIT),
+    )
+
+    # Catch errors here, otherwise they are lost to the void.
+    @async try
+        process_messages(pool)
+    catch exc
+        @error(
+            "An error ocurred in the while processing messages from a "
+                * "ConnectionPool.",
+            exception=exc,
+        )
+    end
+
+    return pool
+end
+
+function addconnection!(pool::ConnectionPool, c::AbstractConnection)
+    put!(pool.new_connections, c)
+end
+
+function Sockets.send(pool::ConnectionPool, msg)
+    put!(pool.outbox, msg)
+end
 
 """
-    ensure_connection(pool::ConnectionPool)
+    ensure_connection(pool)
 
-Ensure that the pool has at least one connection, potentially blocking
-the current task until that is the case.
+Ensure that the pool has at least one connection, potentially blocking the
+current task until that is the case. Also processes incoming connections.
 """
 function ensure_connection(pool::ConnectionPool)
     if isempty(pool.connections)
@@ -45,26 +79,56 @@ end
 
 Base.wait(pool::ConnectionPool) = ensure_connection(pool)
 
+"""
+    process_messages(pool)
+
+Process messages in a connection pool outbox and send them to all connected
+frontends.
+
+This function should be run as a task (it will block forever otherwise).
+"""
 function process_messages(pool::ConnectionPool)
+    ensure_connection(pool)
     while true
-        msg = fetch(pool.outbox)  # don't take! yet, since we're not sure msg can be sent
-        ensure_connection(pool)
-        msg_sent = false
+        msg = take!(pool.outbox)
         @sync begin
+            # This may result in sending to no connections, but we're okay with
+            # that because we'll just get the next value of the observable
+            # (messages are fire and forget - WebIO makes no guarantees that
+            # messages are ever actually delivered).
             for connection in pool.connections
-                @async begin
-                    if isopen(connection)
-                        send(connection, msg)
-                        msg_sent = true
-                    else
-                        delete!(pool.connections, connection)
-                    end
-                end
+                @async send_message(pool, connection, msg)
             end
         end
-        if msg_sent
-            # Message was sent, so remove it from the channel
-            take!(pool.outbox)
+    end
+end
+
+"""
+    send_message(pool, connection, msg)
+
+Send a message to an individual connection within a pool, handling errors and
+deleting the connection from the pool if necessary.
+"""
+function send_message(
+        pool::ConnectionPool,
+        connection::AbstractConnection,
+        msg,
+)::Nothing
+    try
+        if isopen(connection)
+            send(connection, msg)
+        else
+            @info "Connection is not open." connection
+            delete!(pool.connections, connection)
         end
+    catch ex
+        @error(
+            "An exception occurred while trying to send a WebIO message to a "
+                * "frontend:",
+            exception=ex,
+        )
+        delete!(pool.connections, connection)
+    finally
+        return nothing
     end
 end
