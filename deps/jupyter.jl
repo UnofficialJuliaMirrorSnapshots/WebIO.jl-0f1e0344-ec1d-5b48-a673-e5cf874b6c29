@@ -5,6 +5,8 @@ end
 const CONFIG_BEGIN_MARKER = "###JULIA-WEBIO-CONFIG-BEGIN"
 const CONFIG_END_MARKER = "###JULIA-WEBIO-CONFIG-END"
 
+_tryrun(args...; kwargs...) = try run(args...; kwargs...) catch nothing end
+
 """
     install_notebook_config()
 
@@ -143,7 +145,12 @@ function install_jupyter_labextension(
         )
     end
     install_jupyter_serverextension()
+
+    _tryrun(`$jupyter labextension unlink --no-build @webio/webio`)
+    _tryrun(`$jupyter labextension uninstall --no-build @webio/jupyter-lab-provider`)
+
     if dev
+        @info "Installing Jupyter labextension in dev mode..."
         core_path = joinpath(PACKAGES_PATH, "webio")
         lab_provider_path = joinpath(PACKAGES_PATH, "jupyter-lab-provider")
         run(`$jupyter labextension link --no-build $core_path`)
@@ -169,10 +176,15 @@ function install_jupyter_nbextension(
     install_jupyter_serverextension()
 
     # Copy the nbextension files.
+    install_cmd = `$jupyter nbextension install $nbextension_flags $JUPYTER_NBEXTENSION_PATH`
+    @info "Installing Jupyter WebIO extension..." cmd=install_cmd
+    run(install_cmd)
 
-    @info "Installing Jupyter WebIO extension..."
-    run(`$jupyter nbextension install $nbextension_flags $JUPYTER_NBEXTENSION_PATH`)
-    run(`$jupyter nbextension enable $nbextension_flags $JUPYTER_NBEXTENSION_NAME`)
+    enable_cmd = `$jupyter nbextension enable $nbextension_flags $JUPYTER_NBEXTENSION_NAME`
+    @info "Enabling Jupyter WebIO extension..." cmd=enable_cmd
+    run(enable_cmd)
+
+    return nothing
 end
 
 ### BEGIN BORROWED CODE ###
